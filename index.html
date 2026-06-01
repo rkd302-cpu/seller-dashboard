@@ -525,40 +525,73 @@ const {
   ResponsiveContainer
 } = Recharts;
 
-// 로컬 빌드 환경 호환: window.storage가 없으면 localStorage로 대체
+// 로컬 빌드 환경 호환: window.storage가 없으면 IndexedDB로 대체
 // (Claude 아티팩트 환경에선 window.storage가 이미 있어 이 블록은 스킵됨)
+// ⚠️ 과거엔 localStorage를 썼는데, localStorage 용량 한도(약 5MB)는 "키별"이 아니라
+//    "사이트 전체 합계"라서 데이터가 쌓이면 최신 주문 저장이 조용히 실패(QuotaExceededError)
+//    → 재접속 시 일부만 보이는 버그가 있었다. IndexedDB는 한도가 수백 MB~GB라 해결된다.
 if (typeof window !== 'undefined' && !window.storage) {
+  const DB_NAME = 'sellingApp';
+  const STORE = 'kv';
+  const openDB = () => new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  const tx = async (mode, fn) => {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const t = db.transaction(STORE, mode);
+      const store = t.objectStore(STORE);
+      const result = fn(store);
+      t.oncomplete = () => resolve(result);
+      t.onerror = () => reject(t.error);
+      t.onabort = () => reject(t.error);
+    });
+  };
+  const idbGet = key => tx('readonly', store => store.get(key)).then(req => new Promise(resolve => {
+    req.onsuccess = () => resolve(req.result);
+  }));
   window.storage = {
     get: async key => {
-      const value = localStorage.getItem(key);
-      return value !== null ? {
-        value
-      } : null;
+      const value = await idbGet(key);
+      return value != null ? { value } : null;
     },
     set: async (key, value) => {
-      localStorage.setItem(key, value);
-      return {
-        value
-      };
+      await tx('readwrite', store => store.put(value, key));
+      return { value };
     },
     delete: async key => {
-      localStorage.removeItem(key);
-      return {
-        key,
-        deleted: true
-      };
+      await tx('readwrite', store => store.delete(key));
+      return { key, deleted: true };
     },
     list: async prefix => {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (!prefix || k.startsWith(prefix)) keys.push(k);
-      }
-      return {
-        keys
-      };
+      const keys = await tx('readonly', store => store.getAllKeys()).then(req => new Promise(resolve => {
+        req.onsuccess = () => resolve(req.result || []);
+      }));
+      return { keys: prefix ? keys.filter(k => String(k).startsWith(prefix)) : keys };
     }
   };
+  // 일회성 마이그레이션: 기존 localStorage 데이터를 IndexedDB로 이전 (4월분 등 보존)
+  window.__storageMigration = (async () => {
+    try {
+      if (typeof localStorage === 'undefined' || localStorage.length === 0) return;
+      const done = await idbGet('__migratedFromLocalStorage');
+      if (done) return;
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        const v = localStorage.getItem(k);
+        if (v != null) await window.storage.set(k, v);
+      }
+      await window.storage.set('__migratedFromLocalStorage', '1');
+    } catch (e) {
+      console.warn('localStorage→IndexedDB 마이그레이션 건너뜀:', e);
+    }
+  })();
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -687,7 +720,7 @@ function parseOrderRows(rows) {
     const market = String(row['마켓명'] || '');
     const dt = parseOrderDate(row['주문일']);
     return {
-      orderId: String(row['주문번호'] || row['주문고유번호'] || ''),
+      orderId: String(row['주문고유번호'] || row['주문번호'] || ''),  // 라인별 고유키: 다상품 주문 합쳐짐 방지
       orderDate: dt ? dt.toISOString() : null,
       status: String(row['주문상태'] || ''),
       supplierCode: String(row['공급사코드'] || ''),
@@ -880,6 +913,9 @@ function App() {
   // 로드
   useEffect(() => {
     (async () => {
+      if (typeof window !== 'undefined' && window.__storageMigration) {
+        try { await window.__storageMigration; } catch {}
+      }
       const load = async (key, setter, transform = JSON.parse) => {
         try {
           const r = await window.storage.get(key);
@@ -996,15 +1032,18 @@ function App() {
         byMonth[ym].push(o);
       }
       const savedMonths = [];
+      const failed = [];
       for (const [ym, list] of Object.entries(byMonth)) {
         try {
           await window.storage.set(`orders:${ym}`, JSON.stringify(list));
           savedMonths.push(ym);
         } catch (e) {
-          console.error('주문 저장 실패:', e);
+          console.error(`주문 저장 실패 (${ym}):`, e);
+          failed.push(ym);
         }
       }
-      try { await window.storage.set('orderMonths', JSON.stringify(savedMonths)); } catch {}
+      try { await window.storage.set('orderMonths', JSON.stringify(savedMonths)); } catch (e) { console.error('orderMonths 저장 실패:', e); }
+      if (failed.length) showToast(`저장 용량 부족으로 일부 주문(${failed.join(', ')})이 저장되지 않았어요. 브라우저 저장공간을 확인해주세요.`, 'error');
     })();
   }, [orders, loaded]);
   useEffect(() => {
